@@ -1,2 +1,2 @@
-JStompLight
+JStompLite
 ===========
