@@ -5,9 +5,9 @@ import java.util.Map;
 public class Test {
 
   public static void main(String[] args) throws Exception {
-    StompClient sc = new StompClient("dev10.secupay-ag.de", 61614, null, "guest", "guest", false, true) {
+    StompClient sc = new StompClient(new Config("dev10.secupay-ag.de", 61614, null, "guest", "guest", false, true)) {
       @Override
-      void onConnect(final Map<String, String> headers) {
+      protected void onConnect(final Map<String, String> headers) {
         System.out.println("connected");
         System.out.println();
 
@@ -39,13 +39,13 @@ public class Test {
       }
 
       @Override
-      void onReceipt(String id) {
+      protected void onReceipt(String id) {
         System.out.println("got receipt: " + id);
         System.out.println();
       }
 
       @Override
-      void onMessage(String id, String subscription, String destination, Map<String, String> headers, String body) {
+      protected void onMessage(String id, String subscription, String destination, Map<String, String> headers, String body) {
         System.out.println("message:");
         System.out.println("body: " + body);
         System.out.println("header: " + headers);
@@ -53,14 +53,14 @@ public class Test {
       }
 
       @Override
-      void onError(Map<String, String> headers) {
+      protected void onError(Map<String, String> headers) {
         System.out.println("error:");
         System.out.println("header: " + headers);
         System.out.println();
       }
 
       @Override
-      void onDisconnect() {
+      protected void onDisconnect() {
 
       }
     };

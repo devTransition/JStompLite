@@ -6,6 +6,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.HashMap;
 import java.util.Map;
@@ -13,18 +14,19 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public abstract class StompClient {
+  private final Config config;
   private Socket socket;
-  private String host;
-  private String virtualHost;
-  private String login;
-  private String pwd;
-  private Thread receiver = null;
-  private boolean isConnected = false;
-  private boolean useHeartbeat = false;
-  public static final int RECEIVE_TIMEOUT = 10000;
+  private Thread receiver;
+  private Thread watchdog;
+  private boolean isConnected;
+  private long lastReceived;
+  private int heartbeatMs = DEFAULT_HEARTBEAT_MS;
+
+  public static final int DEFAULT_HEARTBEAT_MS = 5000;
 
   public static final String CONNECT = "CONNECT";
   public static final String DISCONNECT = "DISCONNECT";
+  public static final String DISCONNECTED = "DISCONNECTED"; // just internal usage, no stomp command
   public static final String CONNECTED = "CONNECTED";
   public static final String RECEIPT = "RECEIPT";
   public static final String MESSAGE = "MESSAGE";
@@ -39,108 +41,165 @@ public abstract class StompClient {
 
   private final static Logger LOG = Logger.getLogger(StompClient.class.getName());
 
-  public StompClient(String host, int port, String virtualHost, String login, String password, boolean useHeartbeat,
-                     boolean useSsl) throws IOException {
-    this.host = host;
-    this.login = login;
-    this.pwd = password;
-    this.virtualHost = virtualHost;
-    this.useHeartbeat = useHeartbeat;
-
-    SocketFactory socketFactory = useSsl ? SSLSocketFactory.getDefault() : SocketFactory.getDefault();
-    socket = socketFactory.createSocket(host, port);
-
-//    socket.setSoTimeout(RECEIVE_TIMEOUT);
-    receiver = new Receiver();
-    receiver.start();
-
-    if (LOG.isLoggable(Level.INFO)) {
-      LOG.info("started");
-    }
-    // todo: introduce client reusing after close?
+  public StompClient(final Config config) throws IOException {
+    this.config = config;
   }
 
+  private void startReceiving() throws IOException {
+    isConnected = false;
+    lastReceived = 0;
 
-  private class Receiver extends Thread {
-    @Override
-    public void run() {
-      BufferedReader input = null;
-      try {
-        input = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
-        while (!isInterrupted()) {
-          String command = input.readLine();
-          if (command != null && command.length() > 0) {
+    if (config.useHeartbeat()) {
+      stopThread(watchdog);
+    }
+    stopThread(receiver);
 
-            // handle header
-            Map<String, String> headers = new HashMap<String, String>();
-            String line;
-            while ((line = input.readLine()) != null && line.length() > 0) {
-              int idx = line.indexOf(':');
-              if (idx > 0) {
-                headers.put(line.substring(0, idx).toLowerCase(), line.substring(idx + 1));
-              }
-            }
+    if (socket == null || socket.isClosed()) {
+      SocketFactory socketFactory = config.useSsl() ? SSLSocketFactory.getDefault() : SocketFactory.getDefault();
+      socket = socketFactory.createSocket(config.getHost(), config.getPort());
+    }
 
-            // handle body
-            StringBuilder body = new StringBuilder();
-            int b;
-            while ((b = input.read()) != -1 && b != 0) {
-              body.append((char) b);
-            }
+    if (!socket.isConnected()) {
+      socket.connect(new InetSocketAddress(config.getHost(), config.getPort()));
+    }
 
-            if (LOG.isLoggable(Level.INFO)) {
-              LOG.info("frame received: command=" + command + ", header=" + headers + ", body=" + body);
-            }
+    receiver = createReceiver();
+    receiver.start();
 
-            // handle error
-            if (ERROR.equals(command)) {
-              // server closes connection after sending error, so exit after callback
-              onError(headers);
-              break;
-            }
+    if (config.useHeartbeat()) {
+      watchdog = createWatchdog();
+      watchdog.start();
+    }
+  }
 
-
-            dispatch(command, headers, body.toString());
-          }
-        }
-      } catch (Exception e) {
-        throw new RuntimeException(e);
-      } finally {
+  private Thread createReceiver() {
+    return new Thread() {
+      @Override
+      public void run() {
+        BufferedReader input = null;
         try {
-          if (socket != null) {
+          input = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
+          while (!isInterrupted()) {
+            String command = input.readLine();
+            registerReceiving();
+            if (command != null && command.length() > 0) {
+
+              // handle header
+              Map<String, String> headers = new HashMap<String, String>();
+              String line;
+              while ((line = input.readLine()) != null && line.length() > 0) {
+                int idx = line.indexOf(':');
+                if (idx > 0) {
+                  headers.put(line.substring(0, idx).toLowerCase(), line.substring(idx + 1));
+                }
+              }
+
+              // handle body
+              StringBuilder body = new StringBuilder();
+              int b;
+              while ((b = input.read()) != -1 && b != 0) {
+                body.append((char) b);
+              }
+
+              if (LOG.isLoggable(Level.INFO)) {
+                LOG.info("frame received: command=" + command + ", header=" + headers + ", body=" + body);
+              }
+
+              dispatch(command, headers, body.toString());
+
+              if (ERROR.equals(command)) {
+                // server closes connection after sending error, so exit after callback
+                break;
+              }
+
+            }
+          }
+        } catch (Exception e) {
+          throw new RuntimeException(e);
+        } finally {
+          try {
             socket.close();
+
+            if (input != null) {
+              input.close();
+            }
+          } catch (IOException e) {
+            // ignore
+          }
+          isConnected = false;
+        }
+      }
+    };
+  }
+
+  private Thread createWatchdog() {
+    return new Thread() {
+      @Override
+      public void run() {
+        while (!isInterrupted()) {
+          try {
+            Thread.sleep(heartbeatMs);
+          } catch (InterruptedException e) {
+            interrupt();
+            // todo. handle interrupt!!!
           }
 
-          if (input != null) {
-            input.close();
+          long diff = System.currentTimeMillis() - lastReceived;
+          if (diff > 2 * heartbeatMs) {
+            // consider connection as dead
+            stopThread(receiver);
+            dispatch(DISCONNECTED, null, null);
+            break;
           }
-        } catch (IOException e) {
-          // ignore
+
         }
-        isConnected = false;
-        socket = null;
+      }
+    };
+  }
+
+  private static void stopThread(Thread thread) {
+    if (thread != null && thread.isAlive()) {
+      thread.interrupt();
+      try {
+        thread.join();
+      } catch (InterruptedException e) {
+        // ignore
       }
     }
   }
 
-  private void dispatch(String command, Map<String, String> headers, String body) {
-    if (command.equalsIgnoreCase(CONNECTED)) {
-      isConnected = true;
-      onConnect(headers);
-    } else if (command.equalsIgnoreCase(MESSAGE)) {
-      onMessage(headers.get("message-id"), null, headers.get("destination"), headers, body);
-    } else if (command.equalsIgnoreCase(RECEIPT)) {
-      onReceipt(headers.get("receipt-id"));
-    } else {
-      throw new RuntimeException("Unknown command " + command);
+  private void registerReceiving() {
+    lastReceived = System.currentTimeMillis();
+    if (LOG.isLoggable(Level.INFO)) {
+      LOG.info("received");
     }
   }
 
-  private void sendFrame(String command, Map<String, String> header, String message) {
-    if (socket == null) {
-      throw new RuntimeException("Connection closed");
+  private void dispatch(String command, Map<String, String> headers, String body) {
+    try {
+      if (command.equalsIgnoreCase(CONNECTED)) {
+        isConnected = true;
+        onConnect(headers);
+      } else if (command.equalsIgnoreCase(MESSAGE)) {
+        onMessage(headers.get("message-id"), null, headers.get("destination"), headers, body);
+      } else if (command.equalsIgnoreCase(RECEIPT)) {
+        onReceipt(headers.get("receipt-id"));
+      } else if (command.equalsIgnoreCase(ERROR)) {
+        onError(headers);
+      } else if (command.equalsIgnoreCase(DISCONNECTED)) {
+        isConnected = false;
+        if (LOG.isLoggable(Level.INFO)) {
+          LOG.info("disconnected");
+        }
+        onDisconnect();
+      }
+    } catch (Exception e) {
+      // ignore to not let exceptions produced in callbacks exit the receiver loop
     }
+  }
 
+
+  private void sendFrame(String command, Map<String, String> header, String message) {
     StringBuilder frame = new StringBuilder();
     frame.append(command).append("\n");
 
@@ -159,6 +218,10 @@ public abstract class StompClient {
 
     try {
       byte[] bytes = frame.toString().getBytes("UTF-8");
+      if (socket == null || socket.isClosed()) {
+        dispatch(DISCONNECTED, null, null);
+        return;
+      }
       OutputStream outputStream = socket.getOutputStream();
       outputStream.write(bytes);
       outputStream.write(0);
@@ -175,8 +238,9 @@ public abstract class StompClient {
     if (isConnected) {
       sendFrame(DISCONNECT, null, null);
     }
-    receiver.interrupt();
-    receiver = null;
+
+    stopThread(watchdog);
+    stopThread(receiver);
 
     if (LOG.isLoggable(Level.INFO)) {
       LOG.info("closed");
@@ -184,18 +248,24 @@ public abstract class StompClient {
   }
 
   public void connect() throws IOException {
+    startReceiving();
+
+    if (LOG.isLoggable(Level.INFO)) {
+      LOG.info("started");
+    }
+
     Map<String, String> header = new HashMap<String, String>();
-    if (login != null) {
-      header.put("login", login);
+    if (config.getLogin() != null) {
+      header.put("login", config.getLogin());
     }
-    if (pwd != null) {
-      header.put("passcode", pwd);
+    if (config.getPassword() != null) {
+      header.put("passcode", config.getPassword());
     }
-    if (virtualHost != null) {
-      header.put("host", virtualHost);
+    if (config.getVirtualHost() != null) {
+      header.put("host", config.getVirtualHost());
     }
-    if (useHeartbeat) {
-      // todo
+    if (config.useHeartbeat()) {
+      header.put("heart-beat", "0," + heartbeatMs);
     }
     header.put("accept-version", "1.2");
     sendFrame(CONNECT, header, null);
@@ -295,14 +365,14 @@ public abstract class StompClient {
   Note: These callbacks are not asyncronous, performing blocking operations
   within will also block the receive loop! */
 
-  abstract void onConnect(Map<String, String> headers);
+  protected abstract void onConnect(Map<String, String> headers);
 
-  abstract void onReceipt(String Id);
+  protected abstract void onReceipt(String Id);
 
-  abstract void onMessage(String id, String subscription, String destination, Map<String, String> headers, String body);
+  protected abstract void onMessage(String id, String subscription, String destination, Map<String, String> headers, String body);
 
-  abstract void onError(Map<String, String> headers);
+  protected abstract void onError(Map<String, String> headers);
 
-  abstract void onDisconnect();
+  protected abstract void onDisconnect();
 
 }
