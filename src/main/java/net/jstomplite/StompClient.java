@@ -9,6 +9,8 @@ import java.io.OutputStream;
 import java.net.Socket;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 public abstract class StompClient {
   private Socket socket;
@@ -35,11 +37,13 @@ public abstract class StompClient {
   public static final String COMMIT = "COMMIT";
   public static final String BEGIN = "BEGIN";
 
-  public StompClient(String host, int port, String virtualHost, String login, String pwd, boolean useHeartbeat,
+  private final static Logger LOG = Logger.getLogger(StompClient.class.getName());
+
+  public StompClient(String host, int port, String virtualHost, String login, String password, boolean useHeartbeat,
                      boolean useSsl) throws IOException {
     this.host = host;
     this.login = login;
-    this.pwd = pwd;
+    this.pwd = password;
     this.virtualHost = virtualHost;
     this.useHeartbeat = useHeartbeat;
 
@@ -50,6 +54,9 @@ public abstract class StompClient {
     receiver = new Receiver();
     receiver.start();
 
+    if (LOG.isLoggable(Level.INFO)) {
+      LOG.info("started");
+    }
     // todo: introduce client reusing after close?
   }
 
@@ -74,6 +81,17 @@ public abstract class StompClient {
               }
             }
 
+            // handle body
+            StringBuilder body = new StringBuilder();
+            int b;
+            while ((b = input.read()) != -1 && b != 0) {
+              body.append((char) b);
+            }
+
+            if (LOG.isLoggable(Level.INFO)) {
+              LOG.info("frame received: command=" + command + ", header=" + headers + ", body=" + body);
+            }
+
             // handle error
             if (ERROR.equals(command)) {
               // server closes connection after sending error, so exit after callback
@@ -81,12 +99,6 @@ public abstract class StompClient {
               break;
             }
 
-            // handle body
-            StringBuilder body = new StringBuilder();
-            int b;
-            while ((b = input.read()) != -1 && b != 0) {
-              body.append((char) b);
-            }
 
             dispatch(command, headers, body.toString());
           }
@@ -151,6 +163,9 @@ public abstract class StompClient {
       outputStream.write(bytes);
       outputStream.write(0);
       outputStream.flush();
+      if (LOG.isLoggable(Level.INFO)) {
+        LOG.info("frame sent: command=" + command + ", header=" + header + ", body=" + message);
+      }
     } catch (Exception e) {
       throw new RuntimeException(e);
     }
@@ -162,6 +177,10 @@ public abstract class StompClient {
     }
     receiver.interrupt();
     receiver = null;
+
+    if (LOG.isLoggable(Level.INFO)) {
+      LOG.info("closed");
+    }
   }
 
   public void connect() throws IOException {
