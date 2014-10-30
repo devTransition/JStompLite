@@ -2,10 +2,7 @@ package net.jstomplite;
 
 import javax.net.SocketFactory;
 import javax.net.ssl.SSLSocketFactory;
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
+import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.HashMap;
@@ -17,12 +14,7 @@ public abstract class StompClient {
   private final Config config;
   private Socket socket;
   private Thread receiver;
-  private Thread watchdog;
-  private boolean isConnected;
-  private long lastReceived;
-  private int heartbeatMs = DEFAULT_HEARTBEAT_MS;
-
-  public static final int DEFAULT_HEARTBEAT_MS = 5000;
+  private boolean connected;
 
   public static final String CONNECT = "CONNECT";
   public static final String DISCONNECT = "DISCONNECT";
@@ -45,14 +37,11 @@ public abstract class StompClient {
     this.config = config;
   }
 
-  private void startReceiving() throws IOException {
-    isConnected = false;
-    lastReceived = 0;
-
-    if (config.useHeartbeat()) {
-      stopThread(watchdog);
-    }
-    stopThread(receiver);
+  private void startReceiver() throws IOException {
+    // make sure everything is closed
+    connected = false;
+    stopReceiver();
+    closeSocket();
 
     if (socket == null || socket.isClosed()) {
       SocketFactory socketFactory = config.useSsl() ? SSLSocketFactory.getDefault() : SocketFactory.getDefault();
@@ -62,28 +51,30 @@ public abstract class StompClient {
     if (!socket.isConnected()) {
       socket.connect(new InetSocketAddress(config.getHost(), config.getPort()));
     }
+    connected = true;
 
     receiver = createReceiver();
     receiver.start();
-
-    if (config.useHeartbeat()) {
-      watchdog = createWatchdog();
-      watchdog.start();
-    }
   }
 
   private Thread createReceiver() {
     return new Thread() {
       @Override
       public void run() {
-        BufferedReader input = null;
         try {
-          input = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
+          BufferedReader input = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
           while (!isInterrupted()) {
             String command = input.readLine();
-            registerReceiving();
-            if (command != null && command.length() > 0) {
-
+            if (command == null) {
+              // null shoud never happen under normal circumstances - either read blocks or returns new data
+              // this indicates lost connection, attempting write will throw exception when broken
+              if (write(new byte[]{0})) {
+                if (LOG.isLoggable(Level.SEVERE)) {
+                  LOG.severe("Unexpected successful write after receiving end of stream.");
+                }
+              }
+              Thread.sleep(100);
+            } else if (command.length() > 0) {
               // handle header
               Map<String, String> headers = new HashMap<String, String>();
               String line;
@@ -105,80 +96,22 @@ public abstract class StompClient {
                 LOG.info("frame received: command=" + command + ", header=" + headers + ", body=" + body);
               }
 
-              dispatch(command, headers, body.toString());
-
-              if (ERROR.equals(command)) {
-                // server closes connection after sending error, so exit after callback
-                break;
-              }
-
+              dispatch(command, headers, body.toString(), null);
             }
           }
         } catch (Exception e) {
-          throw new RuntimeException(e);
-        } finally {
-          try {
-            socket.close();
-
-            if (input != null) {
-              input.close();
-            }
-          } catch (IOException e) {
-            // ignore
-          }
-          isConnected = false;
+          // abnormal end - inform client
+          closeSocket();
+          dispatch(DISCONNECTED, null, null, e);
         }
       }
     };
   }
 
-  private Thread createWatchdog() {
-    return new Thread() {
-      @Override
-      public void run() {
-        while (!isInterrupted()) {
-          try {
-            Thread.sleep(heartbeatMs);
-          } catch (InterruptedException e) {
-            interrupt();
-            // todo. handle interrupt!!!
-          }
 
-          long diff = System.currentTimeMillis() - lastReceived;
-          if (diff > 2 * heartbeatMs) {
-            // consider connection as dead
-            stopThread(receiver);
-            dispatch(DISCONNECTED, null, null);
-            break;
-          }
-
-        }
-      }
-    };
-  }
-
-  private static void stopThread(Thread thread) {
-    if (thread != null && thread.isAlive()) {
-      thread.interrupt();
-      try {
-        thread.join();
-      } catch (InterruptedException e) {
-        // ignore
-      }
-    }
-  }
-
-  private void registerReceiving() {
-    lastReceived = System.currentTimeMillis();
-    if (LOG.isLoggable(Level.INFO)) {
-      LOG.info("received");
-    }
-  }
-
-  private void dispatch(String command, Map<String, String> headers, String body) {
+  private void dispatch(String command, Map<String, String> headers, String body, Exception ex) {
     try {
       if (command.equalsIgnoreCase(CONNECTED)) {
-        isConnected = true;
         onConnect(headers);
       } else if (command.equalsIgnoreCase(MESSAGE)) {
         onMessage(headers.get("message-id"), null, headers.get("destination"), headers, body);
@@ -186,20 +119,24 @@ public abstract class StompClient {
         onReceipt(headers.get("receipt-id"));
       } else if (command.equalsIgnoreCase(ERROR)) {
         onError(headers);
+        // if server would close connection after error (like the stomp spec said)
+        // it would handled by the receiver thread (exception)
+        // if not we can go on
       } else if (command.equalsIgnoreCase(DISCONNECTED)) {
-        isConnected = false;
         if (LOG.isLoggable(Level.INFO)) {
-          LOG.info("disconnected");
+          LOG.info("closed");
         }
-        onDisconnect();
+        onDisconnect(ex);
       }
     } catch (Exception e) {
       // ignore to not let exceptions produced in callbacks exit the receiver loop
+      if (LOG.isLoggable(Level.SEVERE)) {
+        LOG.log(Level.SEVERE, "Client error happened", e);
+      }
     }
   }
 
-
-  private void sendFrame(String command, Map<String, String> header, String message) {
+  private boolean sendFrame(String command, Map<String, String> header, String message) {
     StringBuilder frame = new StringBuilder();
     frame.append(command).append("\n");
 
@@ -216,39 +153,85 @@ public abstract class StompClient {
 
     frame.append("\000");
 
+    byte[] bytes = new byte[0];
+
     try {
-      byte[] bytes = frame.toString().getBytes("UTF-8");
-      if (socket == null || socket.isClosed()) {
-        dispatch(DISCONNECTED, null, null);
-        return;
-      }
-      OutputStream outputStream = socket.getOutputStream();
-      outputStream.write(bytes);
-      outputStream.write(0);
-      outputStream.flush();
-      if (LOG.isLoggable(Level.INFO)) {
-        LOG.info("frame sent: command=" + command + ", header=" + header + ", body=" + message);
-      }
-    } catch (Exception e) {
+      bytes = frame.toString().getBytes("UTF-8");
+    } catch (UnsupportedEncodingException e) {
       throw new RuntimeException(e);
     }
-  }
 
-  public void close() throws IOException {
-    if (isConnected) {
-      sendFrame(DISCONNECT, null, null);
+    try {
+      if (!write(bytes)) {
+        return false;
+      }
+    } catch (IOException e) {
+      // connection failure, inform client
+      stopReceiver();
+      dispatch(DISCONNECTED, null, null, e);
+      return false;
     }
-
-    stopThread(watchdog);
-    stopThread(receiver);
 
     if (LOG.isLoggable(Level.INFO)) {
-      LOG.info("closed");
+      LOG.info("frame sent: command=" + command + ", header=" + header + ", body=" + message);
+    }
+
+    return true;
+  }
+
+  /**
+   * Write bytes to the socket.
+   * Used sometimes from receiver thread also, synchonize to avoid effects.
+   * Additionally avoids writing again to the socket if there was an error before.
+   */
+  private synchronized boolean write(byte[] bytes) throws IOException {
+    if (connected) {
+      try {
+        OutputStream out = socket.getOutputStream();
+        out.write(bytes);
+        out.write(0);
+        out.flush();
+      } catch (IOException e) {
+        closeSocket();
+        throw e;
+      }
+      return true;
+    }
+
+    return false;
+  }
+
+  private void stopReceiver() {
+    if (receiver != null && receiver.isAlive()) {
+      receiver.interrupt();
+      try {
+        receiver.join();
+      } catch (InterruptedException e) {
+        // ignore
+      }
     }
   }
 
+  private void closeSocket() {
+    connected = false;
+
+    if (socket != null) {
+      try {
+        socket.close();
+      } catch (IOException e) {
+        //ignore
+      }
+    }
+  }
+
+  /**
+   * Connect to the Stomp server using the given configuration.
+   * No need to call close() in error case. Depending on the error user may call again.
+   *
+   * @throws IOException if a error occurs.
+   */
   public void connect() throws IOException {
-    startReceiving();
+    startReceiver();
 
     if (LOG.isLoggable(Level.INFO)) {
       LOG.info("started");
@@ -264,18 +247,41 @@ public abstract class StompClient {
     if (config.getVirtualHost() != null) {
       header.put("host", config.getVirtualHost());
     }
-    if (config.useHeartbeat()) {
-      header.put("heart-beat", "0," + heartbeatMs);
+    if (config.getHeartbeatMs() > 0) {
+      header.put("heart-beat", config.getHeartbeatMs() + ",0");
     }
     header.put("accept-version", "1.2");
     sendFrame(CONNECT, header, null);
+  }
+
+  /**
+   * Closing the client properly.
+   * Will cause call to onDisconnect() only if successful.
+   * No effect on a already closed or not connected client.
+   */
+  public void close() {
+    // note: if not sent successfully shutdown will be performed anyway
+    if (sendFrame(DISCONNECT, null, null)) {
+      // server closes connection on disconnect,
+      // receiver thread will probably detect first and closes all, no need to do it again
+      // but wait a little for it
+      try {
+        Thread.sleep(200);
+      } catch (InterruptedException e) {
+      }
+      if (connected) {
+        stopReceiver();
+        closeSocket();
+        dispatch(DISCONNECTED, null, null, null);
+      }
+    }
   }
 
   public void send(String destination, String message) throws Exception {
     send(destination, message, null, null);
   }
 
-  public void send(String destination, String message, String transaction, Map<String, String> headers) throws Exception {
+  public void send(String destination, String message, String transaction, Map<String, String> headers) {
     if (headers == null) {
       headers = new HashMap<String, String>();
     }
@@ -294,7 +300,7 @@ public abstract class StompClient {
     subscribe(destination, ack, new HashMap<String, String>());
   }
 
-  public void subscribe(String destination, String ack, Map<String, String> headers) throws Exception {
+  public void subscribe(String destination, String ack, Map<String, String> headers) {
     if (headers == null) {
       headers = new HashMap<String, String>();
     }
@@ -309,7 +315,7 @@ public abstract class StompClient {
     unsubscribe(destination, null);
   }
 
-  public void unsubscribe(String destination, Map<String, String> headers) throws Exception {
+  public void unsubscribe(String destination, Map<String, String> headers) {
     if (headers == null) {
       headers = new HashMap<String, String>();
     }
@@ -317,19 +323,19 @@ public abstract class StompClient {
     sendFrame(UNSUBSCRIBE, headers, null);
   }
 
-  public void begin(String transaction) throws Exception {
+  public void begin(String transaction) {
     HashMap<String, String> headers = new HashMap<String, String>();
     headers.put("transaction", transaction);
     sendFrame(BEGIN, headers, null);
   }
 
-  public void abort(String transaction) throws Exception {
+  public void abort(String transaction) {
     HashMap<String, String> headers = new HashMap<String, String>();
     headers.put("transaction", transaction);
     sendFrame(ABORT, headers, null);
   }
 
-  public void commit(String transaction) throws Exception {
+  public void commit(String transaction) {
     HashMap<String, String> headers = new HashMap<String, String>();
     headers.put("transaction", transaction);
     sendFrame(COMMIT, headers, null);
@@ -339,7 +345,7 @@ public abstract class StompClient {
     ack(messageId, null);
   }
 
-  public void ack(String messageId, String transaction) throws Exception {
+  public void ack(String messageId, String transaction) {
     HashMap<String, String> headers = new HashMap<String, String>();
     headers.put("message-id", messageId);
     if (transaction != null)
@@ -361,18 +367,53 @@ public abstract class StompClient {
     return headers;
   }
 
-  /* Methods to be implemented by sublasses.
+  //--------------------------------------------------------------------------------------------------------------------
+  /*
+  Methods to be implemented by sublasses.
   Note: These callbacks are not asyncronous, performing blocking operations
-  within will also block the receive loop! */
+  within will also block the receive loop!
+  */
 
+  /**
+   * Called when a connected frame was received.
+   *
+   * @param headers The header data.
+   */
   protected abstract void onConnect(Map<String, String> headers);
 
+  /**
+   * Called when a receipt frame was received.
+   *
+   * @param Id The receipt-id header.
+   */
   protected abstract void onReceipt(String Id);
 
-  protected abstract void onMessage(String id, String subscription, String destination, Map<String, String> headers, String body);
+  /**
+   * Called when a message frame was received.
+   *
+   * @param id           The message-id header.
+   * @param subscription The subscription header.
+   * @param destination  The destination header.
+   * @param headers      All the header data at once.
+   * @param body         The message body.
+   */
+  protected abstract void onMessage(String id, String subscription, String destination, Map<String, String> headers,
+                                    String body);
 
+  /**
+   * Called when a error frame was received.
+   * Note: This client is not closed after.
+   *
+   * @param headers The header data.
+   */
   protected abstract void onError(Map<String, String> headers);
 
-  protected abstract void onDisconnect();
+  /**
+   * Called when connection was closed. All client resources are closed too.
+   * To reconnect call connect(), calling close() before is not necessary.
+   *
+   * @param ex The exception when closing was caused by an error, null else.
+   */
+  protected abstract void onDisconnect(Exception ex);
 
 }

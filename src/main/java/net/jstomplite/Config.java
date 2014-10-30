@@ -2,21 +2,33 @@ package net.jstomplite;
 
 public class Config {
   private final String host;
+
   private final int port;
+
   private final String virtualHost;
+
   private final String login;
+
   private final String password;
-  private final boolean useHeartbeat;
+
+  /*
+  This is the client side heart beat interval the server can expect, server closes connection if not fulfilled.
+  Note: the the stomp client itself will not deliver heart beart, this must be done by user sending messages.
+  Server side heart beat not supported.
+  0 for no heart beat.
+  */
   private final boolean useSsl;
 
-  public Config(String host, int port, String virtualHost, String login, String password, boolean useHeartbeat,
+  private final int heartbeatMs;
+
+  public Config(String host, int port, String virtualHost, String login, String password, int heartbeatMs,
                 boolean useSsl) {
     this.host = host;
     this.port = port;
     this.virtualHost = virtualHost;
     this.login = login;
     this.password = password;
-    this.useHeartbeat = useHeartbeat;
+    this.heartbeatMs = heartbeatMs;
     this.useSsl = useSsl;
   }
 
@@ -40,8 +52,8 @@ public class Config {
     return password;
   }
 
-  public boolean useHeartbeat() {
-    return useHeartbeat;
+  public int getHeartbeatMs() {
+    return heartbeatMs;
   }
 
   public boolean useSsl() {

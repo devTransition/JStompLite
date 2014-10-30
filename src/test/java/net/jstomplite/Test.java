@@ -5,7 +5,7 @@ import java.util.Map;
 public class Test {
 
   public static void main(String[] args) throws Exception {
-    StompClient sc = new StompClient(new Config("dev10.secupay-ag.de", 61614, null, "guest", "guest", false, true)) {
+    StompClient sc = new StompClient(new Config("dev10.secupay-ag.de", 61614, null, "guest", "guest", 0, true)) {
       @Override
       protected void onConnect(final Map<String, String> headers) {
         System.out.println("connected");
@@ -60,8 +60,8 @@ public class Test {
       }
 
       @Override
-      protected void onDisconnect() {
-
+      protected void onDisconnect(Exception ex) {
+        System.out.println("disconnect: " + (ex == null ? "" : ex.getMessage()));
       }
     };
     sc.connect();
