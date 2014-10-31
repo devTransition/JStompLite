@@ -33,7 +33,7 @@ public abstract class StompClient {
 
   private final static Logger LOG = Logger.getLogger(StompClient.class.getName());
 
-  public StompClient(final Config config) throws IOException {
+  public StompClient(final Config config) {
     this.config = config;
   }
 
