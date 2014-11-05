@@ -81,7 +81,11 @@ public abstract class StompClient {
               while ((line = input.readLine()) != null && line.length() > 0) {
                 int idx = line.indexOf(':');
                 if (idx > 0) {
-                  headers.put(line.substring(0, idx).toLowerCase(), line.substring(idx + 1));
+                  String key = line.substring(0, idx).toLowerCase();
+                  if (!headers.containsKey(key)) {
+                    // according to the stomp spec just the first header is used if repeated
+                    headers.put(key, line.substring(idx + 1));
+                  }
                 }
               }
 
@@ -136,7 +140,7 @@ public abstract class StompClient {
     }
   }
 
-  private boolean sendFrame(String command, Map<String, String> header, String message) {
+  private boolean sendFrame(String command, Map<String, String> header, String body) {
     StringBuilder frame = new StringBuilder();
     frame.append(command).append("\n");
 
@@ -147,8 +151,8 @@ public abstract class StompClient {
     }
     frame.append("\n");
 
-    if (message != null) {
-      frame.append(message);
+    if (body != null) {
+      frame.append(body);
     }
 
     frame.append("\000");
@@ -173,7 +177,7 @@ public abstract class StompClient {
     }
 
     if (LOG.isLoggable(Level.INFO)) {
-      LOG.info("frame sent: command=" + command + ", header=" + header + ", body=" + message);
+      LOG.info("frame sent: command=" + command + ", header=" + header + ", body=" + body);
     }
 
     return true;
@@ -281,15 +285,19 @@ public abstract class StompClient {
     send(destination, message, null, null);
   }
 
-  public void send(String destination, String message, String transaction, Map<String, String> headers) {
+  public void send(String destination, String body, Map<String, String> headers) throws Exception {
+    send(destination, body, null, headers);
+  }
+
+  public void send(String destination, String body, String transaction, Map<String, String> headers) {
     if (headers == null) {
-      headers = new HashMap<String, String>();
+      headers = new HashMap<>();
     }
     headers.put("destination", destination);
     if (transaction != null) {
       headers.put("transaction", transaction);
     }
-    sendFrame(SEND, headers, message);
+    sendFrame(SEND, headers, body);
   }
 
   public void subscribe(String destination) throws Exception {
