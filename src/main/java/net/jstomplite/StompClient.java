@@ -48,6 +48,8 @@ public abstract class StompClient {
       socket = socketFactory.createSocket(config.getHost(), config.getPort());
     }
 
+    socket.setSoTimeout(config.getSocketTimeoutSec() * 1000);
+
     if (!socket.isConnected()) {
       socket.connect(new InetSocketAddress(config.getHost(), config.getPort()));
     }
@@ -64,16 +66,16 @@ public abstract class StompClient {
         try {
           BufferedReader input = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
           while (!isInterrupted()) {
-            String command = input.readLine();
+            String command;
+            try {
+              command = input.readLine();
+            } catch (java.net.SocketTimeoutException e) {
+              command = null;
+            }
             if (command == null) {
-              // null shoud never happen under normal circumstances - either read blocks or returns new data
-              // this indicates lost connection, attempting write will throw exception when broken
-              if (write(new byte[]{0})) {
-                if (LOG.isLoggable(Level.SEVERE)) {
-                  LOG.severe("Unexpected successful write after receiving end of stream.");
-                }
-              }
-              Thread.sleep(100);
+              // null shoud never happen under normal circumstances
+              // this indicates lost connection or timeout, attempting write will throw exception when actually broken
+              write(new byte[]{0});
             } else if (command.length() > 0) {
               // handle header
               Map<String, String> headers = new HashMap<String, String>();
@@ -228,13 +230,19 @@ public abstract class StompClient {
     }
   }
 
+  public void connect() throws IOException {
+    connect(null, null);
+  }
+
   /**
    * Connect to the Stomp server using the given configuration.
    * No need to call close() in error case. Depending on the error user may call again.
    *
+   * @param login
+   * @param password
    * @throws IOException if a error occurs.
    */
-  public void connect() throws IOException {
+  public void connect(String login, String password) throws IOException {
     startReceiver();
 
     if (LOG.isLoggable(Level.INFO)) {
@@ -242,11 +250,14 @@ public abstract class StompClient {
     }
 
     Map<String, String> header = new HashMap<String, String>();
-    if (config.getLogin() != null) {
-      header.put("login", config.getLogin());
+
+    String log = login == null ? config.getLogin() : login;
+    if (log != null) {
+      header.put("login", log);
     }
-    if (config.getPassword() != null) {
-      header.put("passcode", config.getPassword());
+    String pwd = password == null ? config.getPassword() : password;
+    if (pwd != null) {
+      header.put("passcode", pwd);
     }
     if (config.getVirtualHost() != null) {
       header.put("host", config.getVirtualHost());
@@ -273,6 +284,7 @@ public abstract class StompClient {
         Thread.sleep(200);
       } catch (InterruptedException e) {
       }
+
       if (connected) {
         stopReceiver();
         closeSocket();

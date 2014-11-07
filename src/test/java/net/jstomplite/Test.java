@@ -5,7 +5,7 @@ import java.util.Map;
 public class Test {
 
   public static void main(String[] args) throws Exception {
-    StompClient sc = new StompClient(new Config("dev10.secupay-ag.de", 61614, null, "guest", "guest", 0, true)) {
+    StompClient sc = new StompClient(new Config("dev10.secupay-ag.de", 61614, null, "guest", "guest", 0, true, 10)) {
       @Override
       protected void onConnect(final Map<String, String> headers) {
         System.out.println("connected");
@@ -15,7 +15,7 @@ public class Test {
           public void run() {
             try {
 //                            subscribe("/queue/test");
-              for (int i = 0; i < 10; i++) {
+              for (int i = 0; i < 1; i++) {
                 send("/exchange/connect.api/api:get:General.Skeletons",
 //                                send("/exchange/connect.api/api:exec:Smart.Devices.register",
 //                                        "{pid: 'me',data:{type:'cashier',uid:'nicotest'}}", null,
@@ -24,9 +24,9 @@ public class Test {
                         "content-type", "application/json",
                         "user-id", "guest",
                         "reply-to", "/temp-queue/main",
-                        "correlation-id", "" + i,
+                        "correlation-id", "" + i + 100,
                         "persistent", "true",
-                        "receipt", "message" + i
+                        "receipt", ""   + i + 100
                     )
                 );
                 Thread.sleep(10000);
@@ -64,7 +64,7 @@ public class Test {
         System.out.println("disconnect: " + (ex == null ? "" : ex.getMessage()));
       }
     };
-    sc.connect();
+    sc.connect(null, null);
     Thread.sleep(10000);
     sc.close();
   }

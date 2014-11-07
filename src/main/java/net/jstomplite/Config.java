@@ -11,6 +11,8 @@ public class Config {
 
   private final String password;
 
+  private final int socketTimeoutSec;
+
   /*
   This is the client side heart beat interval the server can expect, server closes connection if not fulfilled.
   Note: the the stomp client itself will not deliver heart beart, this must be done by user sending messages.
@@ -22,7 +24,7 @@ public class Config {
   private final int heartbeatMs;
 
   public Config(String host, int port, String virtualHost, String login, String password, int heartbeatMs,
-                boolean useSsl) {
+                boolean useSsl, int socketTimeoutSec) {
     this.host = host;
     this.port = port;
     this.virtualHost = virtualHost;
@@ -30,6 +32,7 @@ public class Config {
     this.password = password;
     this.heartbeatMs = heartbeatMs;
     this.useSsl = useSsl;
+    this.socketTimeoutSec = socketTimeoutSec;
   }
 
   public String getHost() {
@@ -58,5 +61,9 @@ public class Config {
 
   public boolean useSsl() {
     return useSsl;
+  }
+
+  public int getSocketTimeoutSec() {
+    return socketTimeoutSec;
   }
 }
