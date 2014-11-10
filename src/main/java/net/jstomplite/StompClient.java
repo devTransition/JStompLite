@@ -108,7 +108,7 @@ public abstract class StompClient {
         } catch (Exception e) {
           // abnormal end - inform client
           closeSocket();
-          dispatch(DISCONNECTED, null, null, e);
+           dispatch(DISCONNECTED, null, null, e);
         }
       }
     };
