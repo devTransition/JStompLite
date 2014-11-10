@@ -218,7 +218,7 @@ public abstract class StompClient {
     }
   }
 
-  private void closeSocket() {
+  private synchronized void closeSocket() {
     connected = false;
 
     if (socket != null) {
