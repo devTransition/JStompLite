@@ -11,6 +11,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 public abstract class StompClient {
+  public static final int DEFAULT_SOCKET_TIMEOUT_S = 30;
   private final Config config;
   private Socket socket;
   private Thread receiver;
@@ -48,7 +49,11 @@ public abstract class StompClient {
       socket = socketFactory.createSocket(config.getHost(), config.getPort());
     }
 
-    socket.setSoTimeout(config.getSocketTimeoutSec() * 1000);
+    int timeout = config.getSocketTimeoutSec();
+    if (timeout <= 0) {
+      timeout = DEFAULT_SOCKET_TIMEOUT_S; // we need a timeout, otherwise the receiver thread can block forever
+    }
+    socket.setSoTimeout(timeout * 1000);
 
     if (!socket.isConnected()) {
       socket.connect(new InetSocketAddress(config.getHost(), config.getPort()));
@@ -108,7 +113,7 @@ public abstract class StompClient {
         } catch (Exception e) {
           // abnormal end - inform client
           closeSocket();
-           dispatch(DISCONNECTED, null, null, e);
+          dispatch(DISCONNECTED, null, null, e);
         }
       }
     };
@@ -132,6 +137,7 @@ public abstract class StompClient {
         if (LOG.isLoggable(Level.INFO)) {
           LOG.info("closed");
         }
+        // todo: avoid dispatching close multiple times
         onDisconnect(ex);
       }
     } catch (Exception e) {
@@ -273,8 +279,17 @@ public abstract class StompClient {
    * Closing the client properly.
    * Will cause call to onDisconnect() only if successful.
    * No effect on a already closed or not connected client.
+   *
+   * @param disconnect If true send disconnect message to server else just close this clients resources.
    */
-  public void close() {
+  public void close(boolean disconnect) {
+    if (!disconnect) {
+      stopReceiver();
+      closeSocket();
+      dispatch(DISCONNECTED, null, null, null);
+      return;
+    }
+
     // note: if not sent successfully shutdown will be performed anyway
     if (sendFrame(DISCONNECT, null, null)) {
       // server closes connection on disconnect,
@@ -293,11 +308,15 @@ public abstract class StompClient {
     }
   }
 
-  public void send(String destination, String message) throws Exception {
+  public void close() {
+    close(true);
+  }
+
+  public void send(String destination, String message) {
     send(destination, message, null, null);
   }
 
-  public void send(String destination, String body, Map<String, String> headers) throws Exception {
+  public void send(String destination, String body, Map<String, String> headers) {
     send(destination, body, null, headers);
   }
 

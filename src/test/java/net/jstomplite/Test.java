@@ -66,7 +66,7 @@ public class Test {
     };
     sc.connect(null, null);
     Thread.sleep(10000);
-    sc.close();
+    sc.close(true);
   }
 }
 
