@@ -15,24 +15,11 @@
  */
 package net.jstomplite;
 
-public class Test {
-  public static void main(String[] args) throws Exception {
-    final StompClient client = new StompClient(
-        new Config("localhost", 61613, null, "guest", "guest", 0, false, 20, 10, 5));
-    simple(client);
+public class ConnectionTimeoutException extends Exception {
+  public ConnectionTimeoutException() {
   }
 
-  private static void simple(StompClient client) {
-    try {
-      client.open(null, null);
-      client.send("/queue/test", null, null);
-    } catch (Exception e) {
-      e.printStackTrace();
-    } finally {
-      client.close();
-    }
+  public ConnectionTimeoutException(String message) {
+    super(message);
   }
-
 }
-
-
