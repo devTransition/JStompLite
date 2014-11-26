@@ -25,7 +25,6 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -44,10 +43,12 @@ public class StompClient implements StompEventListener {
   private Thread receiver;
   private StompEventListener eventListener;
   private volatile boolean connected;
+  private final Object monitor = new Object();
   private BufferedReader reader;
   private volatile boolean stopReceiver;
   private volatile boolean shutdown;
-  private final Map<String, Object> receipts = new ConcurrentHashMap<>(20, 0.75f, 2);
+  private final Map<String, Frame> receipts = new HashMap<>(20);
+  private final String id;
 
   public static final int DEFAULT_SOCKET_TIMEOUT_S = 30;
   public static final String CONNECT = "CONNECT";
@@ -66,17 +67,17 @@ public class StompClient implements StompEventListener {
    * Creates a instance with itself attached as event lister.
    * Override the according methods like {@link StompEventListener#onConnect()}
    */
-  public StompClient(Config config) {
-    this(config, null);
+  public StompClient(String id, Config config) {
+    this(id, config, null);
   }
 
   /**
    * Create a instance with the provided event listener attached.
    */
-  public StompClient(Config config, StompEventListener eventListener) {
+  public StompClient(String id, Config config, StompEventListener eventListener) {
     this.config = config;
+    this.id = id;
     this.eventListener = eventListener == null ? this : eventListener;
-    this.connected = false;
 
     if (LOG.isLoggable(Level.INFO)) {
       LOG.info("stomp client created, " + config);
@@ -127,9 +128,7 @@ public class StompClient implements StompEventListener {
 
     sendConnect(login, password); // errors on send will be handled by the receiver thread already
 
-    awaitConnected();
-
-    if (!connected) {
+    if (!awaitConnected()) {
       close(true);
       throw new ConnectionTimeoutException();
     }
@@ -180,17 +179,18 @@ public class StompClient implements StompEventListener {
   /**
    * Submitting a SEND frame and waits for the receipt.
    * Throws a exception if not successfully sent. Depending on the exception the client should be closed,
-   * actually only in case of IOException. But
+   * actually only in case of IOException.
    *
    * @param destination
    * @param body
    * @param headers
+   * @param requestReceipt  If true a receipt is requested else not.
    * @throws IOException        If a rather technical error happened.
    * @throws StompException     If the server could not process the message correctly and sent an error instead receipt.
    * @throws NoReceiptException If the receipt was not received in time.
    *                            Timeout is {@link Config#getReceiptTimeoutSec()}
    */
-  public synchronized void send(String destination, String body, Map<String, String> headers)
+  public synchronized void send(String destination, String body, Map<String, String> headers, boolean requestReceipt)
       throws IOException, StompException, NoReceiptException {
     if (!connected) {
       return;
@@ -201,24 +201,32 @@ public class StompClient implements StompEventListener {
     }
     String id = createReceiptId();
     headers.put("destination", destination);
-    headers.put("receipt", id);
+    if (requestReceipt) {
+      headers.put("receipt", id);
+    }
     sendFrame(SEND, headers, body);
 
-    awaitReceipt(id);
-
-    if (!receipts.containsKey(id)) {
-      throw new NoReceiptException("No receipts");
+    if (!requestReceipt) {
+      return;
     }
 
-    Object value = receipts.remove(id);
-    if ("".equals(value)) {
+    Frame receipt = awaitReceipt(id);
+    if (receipt == null) {
+      throw new NoReceiptException("No receipt received");
+    }
+
+    if (receipt.command.equals(RECEIPT)) {
       // success
       return;
     }
 
     // this is a error
-    Map err = (Map) value;
-    throw new StompException((String) err.get("body"), (Map) err.get("headers"));
+    throw new StompException(receipt.body, receipt.headers);
+  }
+
+  public synchronized void send(String destination, String body, Map<String, String> headers)
+      throws IOException, StompException, NoReceiptException {
+    send(destination, body, headers, true);
   }
 
   private void sendDisconnect(String id) throws IOException {
@@ -274,14 +282,13 @@ public class StompClient implements StompEventListener {
 
     write(bytes);
 
-    if (LOG.isLoggable(Level.INFO)) {
-      LOG.info("frame sent: command=" + command + ", header=" + header + ", body=" + body);
+    if (LOG.isLoggable(Level.FINE)) {
+      LOG.fine("frame sent: command=" + command + ", header=" + header + ", body=" + body);
     }
   }
 
   private String createReceiptId() {
-    // todo: user id field instead of hashCode?
-    return "" + hashCode() + System.currentTimeMillis();
+    return (id == null ? Integer.toString(hashCode()) : id) + "-" + System.currentTimeMillis();
   }
 
   private void close(boolean stopReceiver) {
@@ -311,50 +318,26 @@ public class StompClient implements StompEventListener {
 
 
   private void receive() {
-    if (LOG.isLoggable(Level.FINE)) {
-      LOG.fine("receiver started");
-    }
+    LOG.fine("receiver started");
 
-    Map<String, String> headers = new HashMap<>(10);
-    String body = null, command = null;
     while (!stopReceiver) {
       try {
         String line = reader.readLine();
+        if (LOG.isLoggable(Level.FINEST)) {
+          LOG.finest("line={" + line + "}");
+        }
         if (line == null) {
           write(null);
-
-        } else if (SERVER_FRAMES.contains(line)) {
-          headers.clear();
-          command = line;
-          body = null;
-
-        } else if (line.equals("\u0000")) {
-          if (LOG.isLoggable(Level.INFO)) {
-            LOG.info("frame received: command=" + command + ", header=" + headers + ", body=" + body);
-          }
-          handleMessage(command, new HashMap<>(headers), body); // must copy headers
-          headers.clear();
-          body = command = null;
-
-        } else if (line.length() == 0 && body == null) {
-          // header separator, switch to body
-          body = "";
-
-        } else if (body == null) {
-          int idx = line.indexOf(':');
-          if (idx > 0) {
-            String key = line.substring(0, idx).toLowerCase();
-            if (!headers.containsKey(key)) {
-              // according to the stomp spec just the first header is used if repeated
-              headers.put(key, line.substring(idx + 1));
-            }
-          }
-
         } else {
-          body += line;
-
+          line = line.trim();
+          if (SERVER_FRAMES.contains(line)) {
+            Frame frame = readFrame(line, reader);
+            if (LOG.isLoggable(Level.FINE)) {
+              LOG.fine("frame received: " + frame);
+            }
+            handleMessage(frame);
+          }
         }
-
       } catch (SocketTimeoutException e) {
         // just regular timeout, ignore
       } catch (IOException e) {
@@ -363,35 +346,83 @@ public class StompClient implements StompEventListener {
           // report only other
           StringWriter out = new StringWriter();
           e.printStackTrace(new PrintWriter(out));
-          handleMessage(ERROR, null, out.toString());
+          handleMessage(new Frame(ERROR, null, out.toString()));
         }
         close(false);
         break;
       }
     }
-    if (LOG.isLoggable(Level.FINE)) {
-      LOG.fine("receiver stopped");
-    }
+    LOG.fine("receiver stopped");
   }
 
-  private void handleMessage(String command, Map<String, String> headers, String body) {
-    try {
-      String receiptId = headers == null ? null : headers.get("receipt-id");
-      if (command.equals(CONNECTED)) {
-        connected = true;
-      } else if (command.equals(RECEIPT)) {
-        receipts.put(receiptId, "");
-      } else if (command.equals(MESSAGE)) {
-        eventListener.onMessage(headers, body);
-      } else if (command.equals(ERROR)) {
-        if (receiptId != null) {
-          Map message = new HashMap();
-          message.put("body", body);
-          message.put("headers", headers);
-          receipts.put(receiptId, message);
-        } else {
-          eventListener.onError(headers, body);
+  private Frame readFrame(String command, BufferedReader reader) throws IOException {
+    Frame frm = new Frame(command);
+
+    // read header
+    frm.headers = new HashMap<>(10);
+    int contentLength = 0;
+    String line;
+    while ((line = reader.readLine()).length() > 0) {
+      int idx = line.indexOf(':');
+      if (idx > 0) {
+        String key = line.substring(0, idx).toLowerCase();
+        if (!frm.headers.containsKey(key)) {
+          // according to the stomp spec just the first header is used if repeated
+          String value = line.substring(idx + 1);
+          frm.headers.put(key, value);
+          if (key.equals("content-length")) {
+            contentLength = Integer.parseInt(value);
+          }
         }
+      }
+    }
+
+    // read body
+    if (contentLength > 0) {
+      char[] buf = new char[contentLength];
+      reader.read(buf, 0, contentLength);
+      frm.body = new String(buf).trim();
+    } else {
+      StringBuilder sb = new StringBuilder();
+      int b;
+      while ((b = reader.read()) != -1 && b != 0) {
+        sb.append((char) b);
+      }
+      frm.body = sb.toString();
+    }
+
+    return frm;
+  }
+
+  private void handleMessage(Frame frame) {
+    try {
+      String receiptId = frame.headers == null ? null : frame.headers.get("receipt-id");
+      switch (frame.command) {
+        case CONNECTED:
+          synchronized (monitor) {
+            connected = true;
+            monitor.notify();
+          }
+          break;
+        case RECEIPT:
+          synchronized (receipts) {
+            receipts.put(receiptId, new Frame(RECEIPT));
+            receipts.notify();
+          }
+          break;
+        case MESSAGE:
+          eventListener.onMessage(frame.headers, frame.body);
+          break;
+        case ERROR:
+          if (receiptId != null) {
+            synchronized (receipts) {
+              receipts.put(receiptId, frame);
+              receipts.notify();
+            }
+          } else {
+            eventListener.onError(frame.headers, frame.body);
+          }
+          break;
       }
     } catch (Exception e) {
       // ignore to not let exceptions produced in callbacks exit the receiver loop
@@ -413,26 +444,39 @@ public class StompClient implements StompEventListener {
     }
   }
 
-  private void awaitConnected() {
+  private boolean awaitConnected() {
     long maxWaitTime = System.currentTimeMillis() + config.getConnectionTimeoutSec() * 1000;
-    while ((System.currentTimeMillis() < maxWaitTime) && !connected) {
-      try {
-        Thread.sleep(10);
-      } catch (InterruptedException e) {
-        break;
+    synchronized (monitor) {
+      while (System.currentTimeMillis() <= maxWaitTime) {
+        if (connected) {
+          return true;
+        }
+        try {
+          monitor.wait(1000);
+        } catch (InterruptedException e) {
+          return connected;
+        }
       }
     }
+    return false;
   }
 
-  private void awaitReceipt(String id) {
+  private Frame awaitReceipt(String id) {
     long maxWaitTime = System.currentTimeMillis() + config.getReceiptTimeoutSec() * 1000;
-    while ((System.currentTimeMillis() < maxWaitTime) && !receipts.containsKey(id)) {
-      try {
-        Thread.sleep(10);
-      } catch (InterruptedException e) {
-        break;
+    synchronized (receipts) {
+      while (System.currentTimeMillis() <= maxWaitTime) {
+        Frame receipt = receipts.remove(id);
+        if (receipt != null) {
+          return receipt;
+        }
+        try {
+          receipts.wait(1000);
+        } catch (InterruptedException e) {
+          return receipts.remove(id);
+        }
       }
     }
+    return null;
     // todo: cleanup old receipts
   }
 
@@ -466,6 +510,35 @@ public class StompClient implements StompEventListener {
 
   @Override
   public void onDisconnect() {
+  }
+
+
+  private class Frame {
+    public String command;
+    public Map<String, String> headers;
+    public String body;
+
+    private Frame() {
+    }
+
+    private Frame(String command) {
+      this.command = command;
+    }
+
+    private Frame(String command, Map<String, String> headers, String body) {
+      this.command = command;
+      this.headers = headers;
+      this.body = body;
+    }
+
+    @Override
+    public String toString() {
+      return "Frame{" +
+          "command='" + command + '\'' +
+          ", headers=" + headers +
+          ", body='" + body + '\'' +
+          '}';
+    }
   }
 
 }
