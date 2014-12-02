@@ -25,7 +25,7 @@ public class Test {
   private static void simple(StompClient client) {
     try {
       client.open(null, null);
-      client.send("/queue/test", null, null);
+      client.send("/queue/test", null, null, true);
     } catch (Exception e) {
       e.printStackTrace();
     } finally {

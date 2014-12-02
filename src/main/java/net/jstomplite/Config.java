@@ -24,6 +24,7 @@ public class Config {
   private final int socketTimeoutSec;
   private final int receiptTimeoutSec;
   private final int connectionTimeoutSec;
+  private final boolean disconnectOnError;
 
   /*
   This is the client side heart beat interval the server can expect, server closes connection if not fulfilled.
@@ -34,6 +35,22 @@ public class Config {
   private final boolean useSsl;
 
   private final int heartbeatMs;
+
+  public Config(String host, int port, String virtualHost, String login, String password, int heartbeatMs,
+                boolean useSsl, int socketTimeoutSec, int receiptTimeoutSec, int connectionTimeoutSec,
+                boolean disconnectOnError) {
+    this.host = host;
+    this.port = port;
+    this.virtualHost = virtualHost;
+    this.login = login;
+    this.password = password;
+    this.heartbeatMs = heartbeatMs;
+    this.useSsl = useSsl;
+    this.socketTimeoutSec = socketTimeoutSec;
+    this.receiptTimeoutSec = receiptTimeoutSec;
+    this.connectionTimeoutSec = connectionTimeoutSec;
+    this.disconnectOnError = disconnectOnError;
+  }
 
   public Config(String host, int port, String virtualHost, String login, String password, int heartbeatMs,
                 boolean useSsl, int socketTimeoutSec, int receiptTimeoutSec, int connectionTimeoutSec) {
@@ -47,6 +64,7 @@ public class Config {
     this.socketTimeoutSec = socketTimeoutSec;
     this.receiptTimeoutSec = receiptTimeoutSec;
     this.connectionTimeoutSec = connectionTimeoutSec;
+    this.disconnectOnError = true;
   }
 
   public String getHost() {
@@ -89,6 +107,10 @@ public class Config {
     return connectionTimeoutSec;
   }
 
+  public boolean disconnectOnError() {
+    return disconnectOnError;
+  }
+
   @Override
   public String toString() {
     return "Config{" +
@@ -100,6 +122,7 @@ public class Config {
         ", socketTimeoutSec=" + socketTimeoutSec +
         ", receiptTimeoutSec=" + receiptTimeoutSec +
         ", connectionTimeoutSec=" + connectionTimeoutSec +
+        ", disconnectOnError=" + disconnectOnError +
         ", useSsl=" + useSsl +
         ", heartbeatMs=" + heartbeatMs +
         '}';

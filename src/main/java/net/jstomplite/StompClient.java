@@ -42,7 +42,7 @@ public class StompClient implements StompEventListener {
   private Socket socket;
   private Thread receiver;
   private StompEventListener eventListener;
-  private volatile boolean connected;
+  private volatile int connected;
   private final Object monitor = new Object();
   private BufferedReader reader;
   private volatile boolean stopReceiver;
@@ -96,9 +96,11 @@ public class StompClient implements StompEventListener {
    *                                    timeout is {@link Config#getConnectionTimeoutSec()}
    */
   public synchronized void open(String login, String password) throws IOException, ConnectionTimeoutException {
-    if (connected) {
+    if (connected > 0) {
       return;
     }
+
+    connected = 0;
 
     SocketFactory socketFactory = config.useSsl() ? SSLSocketFactory.getDefault() : SocketFactory.getDefault();
     socket = socketFactory.createSocket(config.getHost(), config.getPort());
@@ -115,8 +117,9 @@ public class StompClient implements StompEventListener {
 
     reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
 
+    connected = 1;
+
     stopReceiver = false;
-    connected = false;
     shutdown = false;
     receiver = new Thread(new Runnable() {
       @Override
@@ -151,7 +154,7 @@ public class StompClient implements StompEventListener {
    * The methods fails silently, but the client can be considered as closed anyway.
    */
   public synchronized void close() {
-    if (!connected) {
+    if (connected == 0) {
       return;
     }
 
@@ -161,7 +164,6 @@ public class StompClient implements StompEventListener {
     try {
       sendDisconnect(id);
     } catch (IOException e) {
-      e.printStackTrace();
       // ignore
     }
 
@@ -192,7 +194,7 @@ public class StompClient implements StompEventListener {
    */
   public synchronized void send(String destination, String body, Map<String, String> headers, boolean requestReceipt)
       throws IOException, StompException, NoReceiptException {
-    if (!connected) {
+    if (connected == 0) {
       return;
     }
 
@@ -220,7 +222,7 @@ public class StompClient implements StompEventListener {
       return;
     }
 
-    // this is a error
+    // this was an error
     throw new StompException(receipt.body, receipt.headers);
   }
 
@@ -288,7 +290,7 @@ public class StompClient implements StompEventListener {
   }
 
   private String createReceiptId() {
-    return (id == null ? Integer.toString(hashCode()) : id) + "-" + System.currentTimeMillis();
+    return "rcpt-"  +(id == null ? Integer.toString(hashCode()) : id) + "-" + System.currentTimeMillis();
   }
 
   private void close(boolean stopReceiver) {
@@ -301,7 +303,7 @@ public class StompClient implements StompEventListener {
       }
     }
 
-    connected = false;
+    connected = 0;
 
     try {
       socket.close();
@@ -400,9 +402,13 @@ public class StompClient implements StompEventListener {
       switch (frame.command) {
         case CONNECTED:
           synchronized (monitor) {
-            connected = true;
+            connected = 2;
             monitor.notify();
           }
+          if (LOG.isLoggable(Level.INFO)) {
+            LOG.info("stomp client connected");
+          }
+          eventListener.onConnect();
           break;
         case RECEIPT:
           synchronized (receipts) {
@@ -414,6 +420,9 @@ public class StompClient implements StompEventListener {
           eventListener.onMessage(frame.headers, frame.body);
           break;
         case ERROR:
+          if (config.disconnectOnError()) {
+            close(true);
+          }
           if (receiptId != null) {
             synchronized (receipts) {
               receipts.put(receiptId, frame);
@@ -448,13 +457,13 @@ public class StompClient implements StompEventListener {
     long maxWaitTime = System.currentTimeMillis() + config.getConnectionTimeoutSec() * 1000;
     synchronized (monitor) {
       while (System.currentTimeMillis() <= maxWaitTime) {
-        if (connected) {
+        if (connected == 2) {
           return true;
         }
         try {
           monitor.wait(1000);
         } catch (InterruptedException e) {
-          return connected;
+          return connected == 2;
         }
       }
     }
