@@ -44,6 +44,10 @@ public class StompSupport {
     this.eventListener = eventListener;
     this.id = id;
     this.config = config;
+
+    if (LOG.isLoggable(Level.INFO)) {
+      LOG.info("stomp client created, " + config);
+    }
   }
 
   public synchronized void open(String login, String password) throws IOException {
