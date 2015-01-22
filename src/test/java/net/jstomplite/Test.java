@@ -15,17 +15,49 @@
  */
 package net.jstomplite;
 
+import java.util.HashMap;
+import java.util.Map;
+
 public class Test {
   public static void main(String[] args) throws Exception {
-    final StompClient client = new StompClient(
-        null, new Config("localhost", 61613, null, "guest", "guest", 0, false, 20, 30, 10));
+    final StompSupport client = new StompSupport(
+        "99", new Config("dev10.secupay-ag.de", 61614, null, "smart", "smart", 0, true, 20, 10, 20), new EventListener() {
+      @Override
+      public void onConnect() {
+        System.out.println();
+      }
+
+      @Override
+      public void onReceipt(String receipt) {
+        System.out.println();
+      }
+
+      @Override
+      public void onMessage(Frame frame) {
+        System.out.println(frame);
+      }
+
+      @Override
+      public void onError(Frame frame) {
+        System.out.println(frame);
+      }
+
+      @Override
+      public void onDisconnect() {
+        System.out.println();
+      }
+    });
     simple(client);
   }
 
-  private static void simple(StompClient client) {
+  private static void simple(StompSupport client) {
     try {
       client.open(null, null);
-      client.send("/queue/test", null, null, true);
+      Thread.sleep(1000);
+      Map<String, String> headers = new HashMap<>();
+      headers.put("app-id", "app_a1621caf12f1499c7ffab0c4");
+      client.send("/exchange/connect.api/api:get:General.Skeletons", null, headers, true);
+      Thread.sleep(10000);
     } catch (Exception e) {
       e.printStackTrace();
     } finally {
