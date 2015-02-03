@@ -238,11 +238,19 @@ public class StompSupport {
 
     while (!stopReceiver) {
       try {
+        // socket is supposed to have timeout set!
+        // that means reading will block until line is read or timeout,
+        // this is to avoid endless blocking since it gives time to react on stopReceiver flag
         String line = reader.readLine();
         if (LOG.isLoggable(Level.FINEST)) {
           LOG.finest("line={" + line + "}");
         }
         if (line == null) {
+          // this should not happen in normal case because reading stream until end of stream
+          // is reached is done in Frame class later on,
+          // this could happen when the connection is broken or closed by server when we sent a disconnect
+          // so we write test to see if it's the case - if write throws IOException we must close
+          // and maybe propagate the exception to user if it wasn't a regular disconnect
           write(null);
         } else {
           line = line.trim();
@@ -255,7 +263,7 @@ public class StompSupport {
           }
         }
       } catch (SocketTimeoutException e) {
-        // just regular timeout, ignore
+        // just regular "planned" timeout, ignore and go on
       } catch (IOException e) {
         if (!shutdown) {
           // expected, normal case on shutdown (disconnect was sent)
@@ -263,6 +271,7 @@ public class StompSupport {
           StringWriter out = new StringWriter();
           e.printStackTrace(new PrintWriter(out));
           dispatchFrame(new Frame(ERROR, null, out.toString()));
+          // todo: is reporting necessary?
         }
         closeConnection(false);
         dispatchFrame(new Frame(DISCONNECTED));
