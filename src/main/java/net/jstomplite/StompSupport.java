@@ -23,13 +23,14 @@ public class StompSupport {
   private BufferedReader reader;
   private volatile boolean stopReceiver;
   private volatile boolean shutdown;
+  private volatile boolean initial;
   private final String id;
   protected final Config config;
 
   public static final int DEFAULT_SOCKET_TIMEOUT_S = 30;
   public static final String CONNECT = "CONNECT";
   public static final String DISCONNECT = "DISCONNECT";
-  public static final String DISCONNECTED = "DISCONNECTED";
+  public static final String DISCONNECTED = "DISCONNECTED"; // not a real stomp frame just for internal usage
   public static final String CONNECTED = "CONNECTED";
   public static final String RECEIPT = "RECEIPT";
   public static final String MESSAGE = "MESSAGE";
@@ -46,7 +47,7 @@ public class StompSupport {
     this.config = config;
 
     if (LOG.isLoggable(Level.INFO)) {
-      LOG.info("stomp client created, " + config);
+      LOG.info("STOMP client created, " + config);
     }
   }
 
@@ -75,6 +76,14 @@ public class StompSupport {
   }
 
   public synchronized String close() {
+    if (initial) {
+      // just initial state, no connect performed yet, close all resources
+      closeConnection(true);
+      return null;
+    }
+
+    // if connect was performed successfully before must send disconnect
+    // closing of all further resources will be done by the receiver thread which gets an error on disconnect
     shutdown = true;
     String id = createReceiptId();
     try {
@@ -82,11 +91,7 @@ public class StompSupport {
     } catch (IOException e) {
       // ignore
     }
-
     return id;
-
-    // closing of all further resources will be done by the receiver thread which
-    // gets an error on disconnect
   }
 
   /**
@@ -158,7 +163,7 @@ public class StompSupport {
     write(bytes);
 
     if (LOG.isLoggable(Level.FINE)) {
-      LOG.fine("frame sent: command=" + command + ", header=" + header + ", body=" + body);
+      LOG.fine("Frame sent: command=" + command + ", header=" + header + ", body=" + body);
     }
   }
 
@@ -166,6 +171,7 @@ public class StompSupport {
     try {
       switch (frame.getCommand()) {
         case CONNECTED:
+          initial = false;
           eventListener.onConnect();
           break;
         case DISCONNECTED:
@@ -185,7 +191,7 @@ public class StompSupport {
     } catch (Exception e) {
       // ignore to not let exceptions produced in callbacks exit the receiver loop
       if (LOG.isLoggable(Level.SEVERE)) {
-        LOG.log(Level.SEVERE, "Client error happened", e);
+        LOG.log(Level.SEVERE, "Client error happened.", e);
       }
     }
   }
@@ -204,6 +210,7 @@ public class StompSupport {
 
   private void initConnection() throws IOException {
     shutdown = true;
+    initial = false;
 
     closeConnection(true);
 
@@ -231,10 +238,11 @@ public class StompSupport {
       }
     });
     receiver.start();
+    initial = true;
   }
 
   private void receive() {
-    LOG.fine("receiver started");
+    LOG.fine("Receiver started.");
 
     while (!stopReceiver) {
       try {
@@ -250,35 +258,35 @@ public class StompSupport {
           // is reached is done in Frame class later on,
           // this could happen when the connection is broken or closed by server when we sent a disconnect
           // so we write test to see if it's the case - if write throws IOException we must close
-          // and maybe propagate the exception to user if it wasn't a regular disconnect
           write(null);
         } else {
           line = line.trim();
           if (SERVER_FRAMES.contains(line)) {
             Frame frame = new Frame(line, reader);
             if (LOG.isLoggable(Level.FINE)) {
-              LOG.fine("frame received: " + frame);
+              LOG.fine("Frame received: " + frame);
             }
             dispatchFrame(frame);
           }
         }
       } catch (SocketTimeoutException e) {
-        // just regular "planned" timeout, ignore and go on
-      } catch (IOException e) {
+        // just regular configured socket timeout, ignore and go on
+      } catch (Exception e) {
+        // in most cases this would be an IOException, coming from unstable connection
+        // very unlikely that the receiver loop would work after, so quit and close all
         if (!shutdown) {
-          // expected, normal case on shutdown (disconnect was sent)
-          // report only other
-          StringWriter out = new StringWriter();
-          e.printStackTrace(new PrintWriter(out));
-          dispatchFrame(new Frame(ERROR, null, out.toString()));
-          // todo: is reporting necessary?
+          // exception is expected on shutdown (disconnect was sent), report only in other cases
+          // just log, client can't do something meaningful usually
+          if (LOG.isLoggable(Level.FINE)) {
+            LOG.log(Level.FINE, "Error in receiver loop.", e);
+          }
         }
         closeConnection(false);
         dispatchFrame(new Frame(DISCONNECTED));
         break;
       }
     }
-    LOG.fine("receiver stopped");
+    LOG.fine("Receiver stopped.");
   }
 
   private void closeConnection(boolean stopReceiver) {
