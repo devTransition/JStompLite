@@ -1,15 +1,13 @@
 package net.jstomplite;
 
 import javax.net.SocketFactory;
+import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -214,8 +212,14 @@ public class StompSupport {
 
     closeConnection(true);
 
-    SocketFactory socketFactory = config.useSsl() ? SSLSocketFactory.getDefault() : SocketFactory.getDefault();
-    socket = socketFactory.createSocket(config.getHost(), config.getPort());
+    if (config.useSsl()) {
+      SSLSocket sslSocket = (SSLSocket) SSLSocketFactory.getDefault().createSocket(config.getHost(), config.getPort());
+      // fix TLSv1.2 not in enabled but in supported protocol list, needed to support it
+      sslSocket.setEnabledProtocols(sslSocket.getSupportedProtocols());
+      socket = sslSocket;
+    } else {
+      socket = SocketFactory.getDefault().createSocket(config.getHost(), config.getPort());
+    }
 
     int timeout = config.getSocketTimeoutSec();
     if (timeout <= 0) {
