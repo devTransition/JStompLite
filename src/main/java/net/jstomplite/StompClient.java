@@ -1,58 +1,49 @@
-/**
- * Copyright 2014 hp.weber GmbH & Co secucard KG (www.secucard.com)
- * <p/>
+/*
+ * Copyright (c) 2015. hp.weber GmbH & Co secucard KG (www.secucard.com)
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- * <p/>
- * http://www.apache.org/licenses/LICENSE-2.0
- * <p/>
+ * You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0.
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package net.jstomplite;
 
 import javax.net.SocketFactory;
+import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import java.io.*;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Simple stomp client implementation.
- * Supports only client frames CONNECT, DISCONNECT and SEND.
- * Waits for CONNECTED on CONNECT and waits also for RECEIPT/ERROR on SEND and DISCONNECT,
- * so no receipt handling necessary on using side.
- * Add a listener (or use this instance as listener) to get notified when connection is established/closed and messages
- * or errors arrive. Error messages directly related to a sent message (via receipt) will not be propagated to the
- * listener instead they are wrapped in a exception thrown when sending the message.
+ * Minimal stomp messaging support.
  */
-public class StompClient implements StompEventListener {
-  private final Config config;
+public class StompClient {
   private Socket socket;
   private Thread receiver;
-  private StompEventListener eventListener;
-  private volatile int connected;
-  private final Object monitor = new Object();
+  private final Listener eventListener;
   private BufferedReader reader;
   private volatile boolean stopReceiver;
   private volatile boolean shutdown;
-  private final Map<String, Frame> receipts = new HashMap<>(20);
+  private volatile boolean initial;
+  private volatile boolean connected;
+  private volatile Frame error;
   private final String id;
+  private final Config config;
+  private final Set<String> receipts = new HashSet<>();
 
   public static final int DEFAULT_SOCKET_TIMEOUT_S = 30;
   public static final String CONNECT = "CONNECT";
   public static final String DISCONNECT = "DISCONNECT";
+  public static final String DISCONNECTED = "DISCONNECTED"; // not a real stomp frame just for internal usage
   public static final String CONNECTED = "CONNECTED";
   public static final String RECEIPT = "RECEIPT";
   public static final String MESSAGE = "MESSAGE";
@@ -63,194 +54,282 @@ public class StompClient implements StompEventListener {
 
   private final static Logger LOG = Logger.getLogger(StompClient.class.getName());
 
-  /**
-   * Creates a instance with itself attached as event lister.
-   * Override the according methods like {@link StompEventListener#onConnect()}
-   */
-  public StompClient(String id, Config config) {
-    this(id, config, null);
-  }
-
-  /**
-   * Create a instance with the provided event listener attached.
-   */
-  public StompClient(String id, Config config, StompEventListener eventListener) {
-    this.config = config;
+  public StompClient(String id, Config config, Listener eventListener) {
+    this.eventListener = eventListener;
     this.id = id;
-    this.eventListener = eventListener == null ? this : eventListener;
+    this.config = config;
 
-    if (LOG.isLoggable(Level.INFO)) {
-      LOG.info("stomp client created, " + config);
-    }
+    LOG.info("STOMP client created, " + config);
   }
 
   /**
-   * Connects to the stomp server.
-   * Throws exceptions if not sucessfully, this client should be closed then.
-   * On success {@link StompEventListener#onConnect()} is called.
+   * Connect to STOMP server.
+   * Blocks until success or failure when used without callback.
+   * In all failure cases all resources are properly closed, no need to call disconnect().
    *
-   * @param login    User to connect, may be null.
-   * @param password password, may be null.
-   * @throws IOException                If a error ocurrs.
-   * @throws ConnectionTimeoutException If the server does not acknowledge the connection in time,
-   *                                    timeout is {@link Config#getConnectionTimeoutSec()}
+   * @param user     User name.
+   * @param password User password.
+   * @throws StompError                               if the server responds with an ERROR frame, the frame details are set.
+   * @throws NetworkError if the network failed.
+   * @throws ClientError  if an general error happened.
    */
-  public synchronized void open(String login, String password) throws IOException, ConnectionTimeoutException {
-    if (connected > 0) {
+  public synchronized void connect(String user, String password) {
+    if (connected) {
       return;
-    }
-
-    connected = 0;
-
-    SocketFactory socketFactory = config.useSsl() ? SSLSocketFactory.getDefault() : SocketFactory.getDefault();
-    socket = socketFactory.createSocket(config.getHost(), config.getPort());
-
-    int timeout = config.getSocketTimeoutSec();
-    if (timeout <= 0) {
-      timeout = DEFAULT_SOCKET_TIMEOUT_S; // we need a timeout, otherwise the receiver thread can block forever
-    }
-    socket.setSoTimeout(timeout * 1000);
-
-    if (!socket.isConnected()) {
-      socket.connect(new InetSocketAddress(config.getHost(), config.getPort()));
-    }
-
-    reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
-
-    connected = 1;
-
-    stopReceiver = false;
-    shutdown = false;
-    receiver = new Thread(new Runnable() {
-      @Override
-      public void run() {
-        receive();
-      }
-    });
-    receiver.start();
-
-    sendConnect(login, password); // errors on send will be handled by the receiver thread already
-
-    if (!awaitConnected()) {
-      close(true);
-      throw new ConnectionTimeoutException();
     }
 
     try {
-      eventListener.onConnect();
-    } catch (Exception e) {
-      // ignore
+      initConnection();
+      sendConnect(user, password);
+    } catch (Throwable e) {
+      closeConnection(true);
+      if (e instanceof IOException) {
+        throw new NetworkError(e);
+      }
+      throw new ClientError(e);
     }
 
-    if (LOG.isLoggable(Level.INFO)) {
-      LOG.info("stomp client connected");
-    }
+    awaitConnect();
   }
 
   /**
-   * Closing the server connection by sending DISCONNECT frame, waiting for the receipt and closing all resources.
-   * {@link net.jstomplite.StompEventListener#onDisconnect()} is called when the connection was really closed.
-   * This is not the case when calling close on a already closed client.
-   * The methods fails silently, but the client can be considered as closed anyway.
+   * Disconnect connection to STOMP server.
+   * The event listener {@link StompClient.Listener#onDisconnect()} gets called after disconnect.
+   *
+   * @throws NoReceiptException Only if {@link StompClient.Config#requestDISCONNECTReceipt} is true
+   *                            (default: false) and no receipt could be received in time.
+   * @throws StompError         If an error happens during disconnect attempt. Get details by
+   *                            inspecting the properties.
    */
-  public synchronized void close() {
-    if (connected == 0) {
+  public synchronized void disconnect() {
+    doDisconnect();
+  }
+
+  private void doDisconnect() {
+    if (!connected) {
+      return;
+    }
+    shutdown = true;
+    connected = false;
+
+    if (initial) {
+      // just initial state, no connect performed yet, just close all resources
+      closeConnection(true);
       return;
     }
 
-    shutdown = true;
+    // if connect was performed successfully before must send disconnect
+    // closing of all further resources will be done by the receiver thread which gets an error on disconnect
 
-    String id = createReceiptId();
+    final String id = config.requestDISCONNECTReceipt ? createReceiptId("disconnect") : null;
     try {
       sendDisconnect(id);
     } catch (IOException e) {
-      // ignore
-    }
-
-    awaitReceipt(id);
-
-    if (LOG.isLoggable(Level.INFO)) {
-      LOG.info("stomp client closed");
-    }
-    // maybe a receipt was never received here at least we have waited a bit
-    // to allow server getting all messages
-
-    // closing of all further resources will be done by the receiver thread which gets an error on disconnct
-  }
-
-  /**
-   * Submitting a SEND frame and waits for the receipt.
-   * Throws a exception if not successfully sent. Depending on the exception the client should be closed,
-   * actually only in case of IOException.
-   *
-   * @param destination
-   * @param body
-   * @param headers
-   * @param requestReceipt  If true a receipt is requested else not.
-   * @throws IOException        If a rather technical error happened.
-   * @throws StompException     If the server could not process the message correctly and sent an error instead receipt.
-   * @throws NoReceiptException If the receipt was not received in time.
-   *                            Timeout is {@link Config#getReceiptTimeoutSec()}
-   */
-  public synchronized void send(String destination, String body, Map<String, String> headers, boolean requestReceipt)
-      throws IOException, StompException, NoReceiptException {
-    if (connected == 0) {
+      // ignore an just return
       return;
     }
 
+
+    if (config.requestDISCONNECTReceipt) {
+      awaitReceipt(id, false, null);  // no disconnect because we already sent it
+    }
+
+    dispatchFrame(new Frame(DISCONNECTED));
+  }
+
+
+  /**
+   * Send a message to the stomp server.
+   * Blocks until a receipt is received or receipt timeout if no callback is provided.
+   * The connection is automatically closed when no receipt could be received in time if
+   * {@link Config#disconnectOnSENDReceiptTimeout} is true (default).
+   *
+   * @param destination The destination string.
+   * @param body        The message body or null.
+   * @param headers     The message headers or null.
+   * @param timeoutSec  Timeout for awaiting receipt. Pass null to use the config value.
+   * @throws StompError                               If an error happens during sending.
+   *                                                  Get details by inspecting the properties.
+   *                                                  All resources are closed properly, no need to call disconnect().
+   * @throws NoReceiptException                       If no receipt is received after
+   *                                                  {@link Config#receiptTimeoutSec}. Will NEVER be
+   *                                                  thrown when a callback is provided.
+   * @throws NetworkError if the networks failed.
+   */
+  public synchronized void send(String destination, String body, Map<String, String> headers, Integer timeoutSec) {
     if (headers == null) {
       headers = new HashMap<>();
     }
-    String id = createReceiptId();
+    String id = createReceiptId(body);
     headers.put("destination", destination);
-    if (requestReceipt) {
+    if (config.requestSENDReceipt) {
       headers.put("receipt", id);
     }
-    sendFrame(SEND, headers, body);
 
-    if (!requestReceipt) {
+    try {
+      sendFrame(SEND, headers, body);
+    } catch (Throwable t) {
+      closeConnection(true);
+      if (t instanceof IOException) {
+        throw new NetworkError(t);
+      }
+      throw new ClientError(t);
+    }
+
+    awaitReceipt(id, config.disconnectOnSENDReceiptTimeout, timeoutSec);
+  }
+
+  public boolean isConnected() {
+    return connected;
+  }
+
+  private void onConnected() {
+    connected = true;
+    initial = false;
+  }
+
+  private void onDisconnected() {
+    connected = false;
+    initial = false;
+    eventListener.onDisconnect();
+  }
+
+  private void onReceipt(Frame frame) {
+    String receiptId = frame.getHeaders() == null ? null : frame.getHeaders().get("receipt-id");
+    if (receiptId != null) {
+      synchronized (receipts) {
+        receipts.add(receiptId);
+      }
+    }
+  }
+
+  private void onMessage(Frame frame) {
+    eventListener.onMessage(frame);
+  }
+
+  private void onError(Frame frame) {
+    // always treat as response to a message
+    // just set as current error, must be handled when waiting for connection or receipt
+    error = frame;
+  }
+
+
+  private void awaitConnect() {
+    final long maxWaitTime = System.currentTimeMillis() + config.connectionTimeoutSec * 1000;
+    while (System.currentTimeMillis() <= maxWaitTime) {
+      if (connected || error != null) {
+        break;
+      }
+      try {
+        Thread.sleep(100);
+      } catch (InterruptedException e) {
+        // will be stopped anyway
+      }
+    }
+
+    if (connected) {
       return;
     }
 
-    Frame receipt = awaitReceipt(id);
-    if (receipt == null) {
-      throw new NoReceiptException("No receipt received");
+    if (error != null) {
+      closeConnection(true);
+      String body = error.getBody();
+      Map<String, String> headers = error.getHeaders();
+      error = null;
+      throw new StompError(body, headers);
+    } else {
+      closeConnection(true);
+      throw new NetworkError("Timout waiting for connection.");
     }
-
-    if (receipt.command.equals(RECEIPT)) {
-      // success
-      return;
-    }
-
-    // this was an error
-    throw new StompException(receipt.body, receipt.headers);
   }
 
-  public synchronized void send(String destination, String body, Map<String, String> headers)
-      throws IOException, StompException, NoReceiptException {
-    send(destination, body, headers, true);
+  private void awaitReceipt(final String receiptId, final boolean disconnect, Integer timeoutSec) {
+    // check if receipt was received
+    if (timeoutSec == null) {
+      timeoutSec = config.receiptTimeoutSec;
+    }
+    boolean found = false;
+    long maxWaitTime = System.currentTimeMillis() + timeoutSec * 1000;
+    outer:
+    while (System.currentTimeMillis() <= maxWaitTime && connected && error == null) {
+      synchronized (receipts) {
+        Iterator<String> it = receipts.iterator();
+        while (it.hasNext()) {
+          String next = it.next();
+          if (next.equals(receiptId)) {
+            it.remove();
+            found = true;
+            break outer;
+          }
+        }
+      }
+
+//      LOG.trace("waiting for receipt: ", receiptId);
+      try {
+        Thread.sleep(100);
+      } catch (InterruptedException e) {
+        // will be stopped anyway
+      }
+    }
+
+    // we can treat error as reason to disconnect
+
+    if (error != null || !found) {
+      if (connected && disconnect) {
+        try {
+          disconnect();
+        } catch (Throwable t) {
+          // ignore all
+          LOG.log(Level.SEVERE, "Error disconnecting due receipt timeout or error.", t);
+        }
+      }
+      if (error != null) {
+        String body = error.getBody();
+        Map<String, String> headers = error.getHeaders();
+        error = null;
+        throw new StompError(body, headers);
+      } else {
+        throw new NoReceiptException("No receipt frame received for sent message.");
+      }
+    }
+    // consider receipt as successful disconnect
   }
 
-  private void sendDisconnect(String id) throws IOException {
-    sendFrame(DISCONNECT, createHeader("receipt", id), null);
+  /**
+   * Utility method to build header map from given strings.
+   *
+   * @param args Key and value string pairs (first key, second value). Obviously the numbers of args must be even.
+   * @return The header map.
+   */
+  public static Map<String, String> createHeader(String... args) {
+    Map<String, String> headers = new HashMap<>(args.length / 2);
+    for (int i = 0; i < args.length - 1; i += 2) {
+      headers.put(args[i], args[i + 1]);
+    }
+    return headers;
+  }
+
+
+  private void sendDisconnect(String receiptId) throws IOException {
+    sendFrame(DISCONNECT, receiptId == null ? null : createHeader("receipt", receiptId), null);
   }
 
   private void sendConnect(String login, String password) throws IOException {
-    Map<String, String> header = new HashMap<String, String>();
+    Map<String, String> header = new HashMap<>();
 
-    String log = login == null ? config.getLogin() : login;
+    String log = login == null ? config.login : login;
     if (log != null) {
       header.put("login", log);
     }
-    String pwd = password == null ? config.getPassword() : password;
+    String pwd = password == null ? config.password : password;
     if (pwd != null) {
       header.put("passcode", pwd);
     }
-    if (config.getVirtualHost() != null) {
-      header.put("host", config.getVirtualHost());
+    if (config.virtualHost != null) {
+      header.put("host", config.virtualHost);
     }
-    if (config.getHeartbeatMs() > 0) {
-      header.put("heart-beat", config.getHeartbeatMs() + ",0");
+    if (config.heartbeatMs > 0) {
+      header.put("heart-beat", config.heartbeatMs + ",0");
     }
     header.put("accept-version", "1.2");
     sendFrame(CONNECT, header, null);
@@ -285,164 +364,41 @@ public class StompClient implements StompEventListener {
     write(bytes);
 
     if (LOG.isLoggable(Level.FINE)) {
-      LOG.fine("frame sent: command=" + command + ", header=" + header + ", body=" + body);
+      LOG.fine("Frame sent: command=" + command + ", header=" + header + ", body=" + body);
     }
   }
 
-  private String createReceiptId() {
-    return "rcpt-"  +(id == null ? Integer.toString(hashCode()) : id) + "-" + System.currentTimeMillis();
-  }
-
-  private void close(boolean stopReceiver) {
-    if (stopReceiver) {
-      this.stopReceiver = true;
-      try {
-        receiver.join();
-      } catch (InterruptedException e) {
-        // ignore
-      }
-    }
-
-    connected = 0;
-
+  private void dispatchFrame(Frame frame) {
     try {
-      socket.close();
-    } catch (IOException e) {
-      // ignore
-    }
-
-    try {
-      eventListener.onDisconnect();
-    } catch (Exception e) {
-      // ignore
-    }
-  }
-
-
-  private void receive() {
-    LOG.fine("receiver started");
-
-    while (!stopReceiver) {
-      try {
-        String line = reader.readLine();
-        if (LOG.isLoggable(Level.FINEST)) {
-          LOG.finest("line={" + line + "}");
-        }
-        if (line == null) {
-          write(null);
-        } else {
-          line = line.trim();
-          if (SERVER_FRAMES.contains(line)) {
-            Frame frame = readFrame(line, reader);
-            if (LOG.isLoggable(Level.FINE)) {
-              LOG.fine("frame received: " + frame);
-            }
-            handleMessage(frame);
-          }
-        }
-      } catch (SocketTimeoutException e) {
-        // just regular timeout, ignore
-      } catch (IOException e) {
-        if (!shutdown) {
-          // expected, normal case on shutdown (disconnect was sent)
-          // report only other
-          StringWriter out = new StringWriter();
-          e.printStackTrace(new PrintWriter(out));
-          handleMessage(new Frame(ERROR, null, out.toString()));
-        }
-        close(false);
-        break;
-      }
-    }
-    LOG.fine("receiver stopped");
-  }
-
-  private Frame readFrame(String command, BufferedReader reader) throws IOException {
-    Frame frm = new Frame(command);
-
-    // read header
-    frm.headers = new HashMap<>(10);
-    int contentLength = 0;
-    String line;
-    while ((line = reader.readLine()).length() > 0) {
-      int idx = line.indexOf(':');
-      if (idx > 0) {
-        String key = line.substring(0, idx).toLowerCase();
-        if (!frm.headers.containsKey(key)) {
-          // according to the stomp spec just the first header is used if repeated
-          String value = line.substring(idx + 1);
-          frm.headers.put(key, value);
-          if (key.equals("content-length")) {
-            contentLength = Integer.parseInt(value);
-          }
-        }
-      }
-    }
-
-    // read body
-    if (contentLength > 0) {
-      char[] buf = new char[contentLength];
-      reader.read(buf, 0, contentLength);
-      frm.body = new String(buf).trim();
-    } else {
-      StringBuilder sb = new StringBuilder();
-      int b;
-      while ((b = reader.read()) != -1 && b != 0) {
-        sb.append((char) b);
-      }
-      frm.body = sb.toString();
-    }
-
-    return frm;
-  }
-
-  private void handleMessage(Frame frame) {
-    try {
-      String receiptId = frame.headers == null ? null : frame.headers.get("receipt-id");
-      switch (frame.command) {
+      switch (frame.getCommand()) {
         case CONNECTED:
-          synchronized (monitor) {
-            connected = 2;
-            monitor.notify();
-          }
-          if (LOG.isLoggable(Level.INFO)) {
-            LOG.info("stomp client connected");
-          }
-          eventListener.onConnect();
+          onConnected();
+          break;
+        case DISCONNECTED:
+          onDisconnected();
           break;
         case RECEIPT:
-          synchronized (receipts) {
-            receipts.put(receiptId, new Frame(RECEIPT));
-            receipts.notify();
-          }
+          onReceipt(frame);
           break;
         case MESSAGE:
-          eventListener.onMessage(frame.headers, frame.body);
+          onMessage(frame);
           break;
         case ERROR:
-          if (config.disconnectOnError()) {
-            close(true);
-          }
-          if (receiptId != null) {
-            synchronized (receipts) {
-              receipts.put(receiptId, frame);
-              receipts.notify();
-            }
-          } else {
-            eventListener.onError(frame.headers, frame.body);
-          }
+          onError(frame);
           break;
       }
     } catch (Exception e) {
       // ignore to not let exceptions produced in callbacks exit the receiver loop
-      if (LOG.isLoggable(Level.SEVERE)) {
-        LOG.log(Level.SEVERE, "Client error happened", e);
-      }
+      LOG.log(Level.SEVERE, "Client error happened.", e);
     }
   }
 
   private void write(byte[] bytes) throws IOException {
     synchronized (socket) {
+      if (socket.isClosed()) {
+        LOG.info("Trying to write on closed socket: " + new String(bytes));
+        return;
+      }
       OutputStream out = socket.getOutputStream();
       if (bytes == null) {
         out.write(0);
@@ -453,101 +409,205 @@ public class StompClient implements StompEventListener {
     }
   }
 
-  private boolean awaitConnected() {
-    long maxWaitTime = System.currentTimeMillis() + config.getConnectionTimeoutSec() * 1000;
-    synchronized (monitor) {
-      while (System.currentTimeMillis() <= maxWaitTime) {
-        if (connected == 2) {
-          return true;
-        }
-        try {
-          monitor.wait(1000);
-        } catch (InterruptedException e) {
-          return connected == 2;
-        }
-      }
+  private void initConnection() throws IOException {
+    shutdown = true;
+    initial = false;
+    receipts.clear();
+    error = null;
+
+    closeConnection(true);
+
+    if (config.useSsl) {
+      SSLSocket sslSocket = (SSLSocket) SSLSocketFactory.getDefault().createSocket(config.host, config.port);
+      // fix TLSv1.2 not in enabled but in supported protocol list, needed to support it
+      sslSocket.setEnabledProtocols(sslSocket.getSupportedProtocols());
+      socket = sslSocket;
+    } else {
+      socket = SocketFactory.getDefault().createSocket(config.host, config.port);
     }
-    return false;
+
+    int timeout = config.socketTimeoutSec;
+    if (timeout <= 0) {
+      timeout = DEFAULT_SOCKET_TIMEOUT_S; // we need a timeout, otherwise the receiver thread can block forever
+    }
+    socket.setSoTimeout(timeout * 1000);
+
+    if (!socket.isConnected()) {
+      socket.connect(new InetSocketAddress(config.host, config.port));
+    }
+
+    reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), "UTF-8"));
+
+    stopReceiver = false;
+    shutdown = false;
+    receiver = new Thread(new Runnable() {
+      @Override
+      public void run() {
+        receive();
+      }
+    });
+    receiver.start();
+    initial = true;
   }
 
-  private Frame awaitReceipt(String id) {
-    long maxWaitTime = System.currentTimeMillis() + config.getReceiptTimeoutSec() * 1000;
-    synchronized (receipts) {
-      while (System.currentTimeMillis() <= maxWaitTime) {
-        Frame receipt = receipts.remove(id);
-        if (receipt != null) {
-          return receipt;
+  private void receive() {
+    LOG.info("Receiver started.");
+
+    while (!stopReceiver) {
+      try {
+        // socket is supposed to have timeout set!
+        // that means reading will block until line is read or timeout,
+        // this is to avoid endless blocking since it gives time to react on stopReceiver flag
+        String line = reader.readLine();
+        if (LOG.isLoggable(Level.FINEST)) {
+          LOG.finest("line={" + line + "}");
         }
-        try {
-          receipts.wait(1000);
-        } catch (InterruptedException e) {
-          return receipts.remove(id);
+        if (line == null) {
+          // indicates connection is dropped
+          // write test to see if it's the case - if write throws IOException we must close
+          write(null);
+        } else {
+          line = line.trim();
+          if (SERVER_FRAMES.contains(line)) {
+            Frame frame = new Frame(line, reader);
+            if (LOG.isLoggable(Level.FINE)) {
+
+              LOG.fine("Frame received: " + frame);
+            }
+            dispatchFrame(frame);
+          }
         }
+      } catch (SocketTimeoutException e) {
+        // just regular configured socket timeout, ignore and go on
+      } catch (Exception e) {
+        if (LOG.isLoggable(Level.FINEST)) {
+          LOG.log(Level.FINEST, "Exception happened: ", e);
+        }
+        // in most cases this would be an IOException, coming from dropped connection
+        // very unlikely that the receiver loop would work after, so quit and close all
+        closeConnection(false);
+        if (!shutdown) {
+          // exception is expected on shutdown (disconnect was sent), report only in other cases
+          // just log, client can't do something meaningful usually
+          if (LOG.isLoggable(Level.FINE)) {
+            LOG.log(Level.FINE, "Error in receiver loop.", e);
+          }
+          dispatchFrame(new Frame(DISCONNECTED));
+        }
+        break;
       }
     }
-    return null;
-    // todo: cleanup old receipts
+    LOG.info("Receiver stopped.");
   }
 
   /**
-   * Utility method to build header map from given strings.
+   * Closing all resources silently, no exception is raised because we can do nothing.
    *
-   * @param args Key and value string pairs (first key, second value). Obviously the numbers of args must be even.
-   * @return The header map.
+   * @param stopReceiver True if receiver loop should also be stopped, false else.
    */
-  public static Map<String, String> createHeader(String... args) {
-    Map<String, String> headers = new HashMap<>(args.length / 2);
-    for (int i = 0; i < args.length - 1; i += 2) {
-      headers.put(args[i], args[i + 1]);
-    }
-    return headers;
-  }
-
-  // methods to override to use this instance directly as listener ----------------------------------
-
-  @Override
-  public void onConnect() {
-  }
-
-  @Override
-  public void onMessage(Map<String, String> headers, String body) {
-  }
-
-  @Override
-  public void onError(Map<String, String> headers, String body) {
-  }
-
-  @Override
-  public void onDisconnect() {
-  }
-
-
-  private class Frame {
-    public String command;
-    public Map<String, String> headers;
-    public String body;
-
-    private Frame() {
+  private void closeConnection(boolean stopReceiver) {
+    connected = false;
+    if (stopReceiver && receiver != null && receiver.isAlive()) {
+      this.stopReceiver = true;
+      try {
+        receiver.join();
+      } catch (InterruptedException e) {
+        // ignore
+      }
     }
 
-    private Frame(String command) {
-      this.command = command;
+    if (socket != null) {
+      try {
+        socket.close();
+      } catch (IOException e) {
+        LOG.log(Level.SEVERE, "Error closing socket", e);
+      }
     }
+  }
 
-    private Frame(String command, Map<String, String> headers, String body) {
-      this.command = command;
-      this.headers = headers;
-      this.body = body;
+  private String createReceiptId(String str) {
+    return "rcpt-" + id + "-" + str.hashCode() + "-" + System.currentTimeMillis();
+  }
+
+  /**
+   * Listener interface to get notified when stuff happened.
+   * Note: Exceptions thrown by methods are swallowed (just logged) to not break this clients message receiver loop by
+   * any exception caused by client code.
+   */
+  public static interface Listener {
+
+    /**
+     * Called when a message frame was received.
+     */
+    void onMessage(Frame frame);
+
+    /**
+     * Called when the connection state has changed to disconnect.
+     * Just called when the connection is broken or so, not when disconnecting by intention.
+     */
+    void onDisconnect();
+  }
+
+  public static class Config {
+    // send DISCONNECT when a SEND receipt times out
+    private final boolean disconnectOnSENDReceiptTimeout = true;
+
+    // request a receipt on SEND
+    private final boolean requestSENDReceipt = true;
+
+    // request a receipt on DISCONNECT
+    private final boolean requestDISCONNECTReceipt = false;
+
+    private final String host;
+    private final int port;
+    private final String virtualHost;
+    private final String login;
+    private final String password;
+    private final int socketTimeoutSec;
+    private final int receiptTimeoutSec;
+    private final int connectionTimeoutSec;
+
+    /*
+    This is the client side heart beat interval the server can expect, server closes connection if not fulfilled.
+    Note: the the stomp client itself will not deliver heartbeat, this must be done by user sending messages.
+    Server side heart beat not supported.
+    0 for no heart beat.
+    */
+    private final boolean useSsl;
+
+    private final int heartbeatMs;
+
+    public Config(String host, int port, String virtualHost, String login, String password, int heartbeatMs,
+                  boolean useSsl, int socketTimeoutSec, int receiptTimeoutSec, int connectionTimeoutSec) {
+      this.host = host;
+      this.port = port;
+      this.virtualHost = virtualHost;
+      this.login = login;
+      this.password = password;
+      this.heartbeatMs = heartbeatMs;
+      this.useSsl = useSsl;
+      this.socketTimeoutSec = socketTimeoutSec;
+      this.receiptTimeoutSec = receiptTimeoutSec;
+      this.connectionTimeoutSec = connectionTimeoutSec;
     }
 
     @Override
     public String toString() {
-      return "Frame{" +
-          "command='" + command + '\'' +
-          ", headers=" + headers +
-          ", body='" + body + '\'' +
+      return "Config{" +
+          "disconnectOnSENDReceiptTimeout=" + disconnectOnSENDReceiptTimeout +
+          ", requestSENDReceipt=" + requestSENDReceipt +
+          ", requestDISCONNECTReceipt=" + requestDISCONNECTReceipt +
+          ", host='" + host + '\'' +
+          ", port=" + port +
+          ", virtualHost='" + virtualHost + '\'' +
+          ", login='" + login + '\'' +
+          ", password='" + password + '\'' +
+          ", socketTimeoutSec=" + socketTimeoutSec +
+          ", receiptTimeoutSec=" + receiptTimeoutSec +
+          ", connectionTimeoutSec=" + connectionTimeoutSec +
+          ", useSsl=" + useSsl +
+          ", heartbeatMs=" + heartbeatMs +
           '}';
     }
   }
-
 }

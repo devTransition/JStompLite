@@ -11,14 +11,33 @@
  */
 package net.jstomplite;
 
+import java.util.Map;
+
+
 /**
- * Indicates that no receipt for a message was received in time.
+ * Exception wrapping a STOMP error frame.
  */
-public class NoReceiptException extends RuntimeException {
-  public NoReceiptException() {
+public class StompError extends RuntimeException {
+  private String body;
+  private Map<String, String> headers;
+
+  public String getBody() {
+    return body;
   }
 
-  public NoReceiptException(String message) {
-    super(message);
+  public Map<String, String> getHeaders() {
+    return headers;
+  }
+
+  public StompError(String body, Map<String, String> headers) {
+    this.body = body;
+    this.headers = headers;
+  }
+
+  @Override
+  public String toString() {
+    return super.toString() + ": " +
+        "body='" + body + '\'' +
+        ", headers=" + headers;
   }
 }

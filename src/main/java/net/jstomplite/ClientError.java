@@ -9,16 +9,28 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package net.jstomplite;
 
 /**
- * Indicates that no receipt for a message was received in time.
+ * Indicates a general internal error happened. Usually this kind or error is caused by unexpected, unusual conditions
+ * and is  most likely not recoverable.
+ * <p/>
+ * See {@link #getMessage()} and {@link #getCause()} to get details.
  */
-public class NoReceiptException extends RuntimeException {
-  public NoReceiptException() {
+public class ClientError extends RuntimeException {
+  public ClientError() {
   }
 
-  public NoReceiptException(String message) {
+  public ClientError(String message) {
     super(message);
+  }
+
+  public ClientError(String message, Throwable cause) {
+    super(message, cause);
+  }
+
+  public ClientError(Throwable cause) {
+    super(cause);
   }
 }

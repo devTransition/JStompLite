@@ -9,16 +9,22 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package net.jstomplite;
 
 /**
- * Indicates that no receipt for a message was received in time.
+ * Indicates that the server communication failed because of network problems. The client may repeat the operation
+ * later when the network connection is established again.
  */
-public class NoReceiptException extends RuntimeException {
-  public NoReceiptException() {
+public class NetworkError extends RuntimeException {
+  public NetworkError() {
   }
 
-  public NoReceiptException(String message) {
+  public NetworkError(Throwable cause) {
+    super(cause);
+  }
+
+  public NetworkError(String message) {
     super(message);
   }
 }
